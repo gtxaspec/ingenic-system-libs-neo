@@ -217,7 +217,7 @@ EXPORT int SU_Base_GetVersion(SUVersion *version)
 	if (!version)
 		return -1;
 
-	snprintf(version->chr, MAX_INFO_LEN, "open-sysutils-1.0");
+	snprintf(version->chr, MAX_INFO_LEN, "neo-sysutils-1.0");
 	return 0;
 }
 
