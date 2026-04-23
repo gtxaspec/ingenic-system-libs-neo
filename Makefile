@@ -55,6 +55,7 @@ install-staging:
 	install -m 644 include/sysutils/su_adc.h    $(DESTDIR)$(PREFIX)/include/sysutils/
 	install -m 644 include/sysutils/su_cipher.h $(DESTDIR)$(PREFIX)/include/sysutils/
 	install -m 644 include/sysutils/su_misc.h   $(DESTDIR)$(PREFIX)/include/sysutils/
+	install -m 644 include/sysutils/su_pm.h    $(DESTDIR)$(PREFIX)/include/sysutils/
 	install -m 755 libalog.so       $(DESTDIR)$(PREFIX)/lib/
 	install -m 644 libalog.a        $(DESTDIR)$(PREFIX)/lib/
 	install -m 755 libsysutils.so   $(DESTDIR)$(PREFIX)/lib/

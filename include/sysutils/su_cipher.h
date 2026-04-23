@@ -63,6 +63,9 @@ int SU_CIPHER_Encrypt(int hCipher, unsigned int *srcAddr,
                       unsigned int *dstAddr, unsigned int dataLen);
 int SU_CIPHER_Decrypt(int hCipher, unsigned int *srcAddr,
                       unsigned int *dstAddr, unsigned int dataLen);
+int SU_CIPHER_Malloc_Buffer(int size);
+int SU_CIPHER_Free_Buffer(void);
+int cipher_htonl(const void *src, void *dst, unsigned int len);
 
 #ifdef __cplusplus
 }

@@ -50,17 +50,25 @@ int SU_Base_GetVersion(SUVersion *version);
 int SU_Base_GetDevID(SUDevID *devID);
 int SU_Base_GetTime(SUTime *time);
 int SU_Base_SetTime(SUTime *time);
+int SU_Base_GetTimeMs(int *ms);
 int SU_Base_SUTime2Raw(SUTime *suTime, uint32_t *rawTime);
 int SU_Base_Raw2SUTime(uint32_t *rawTime, SUTime *suTime);
 int SU_Base_SetAlarm(SUTime *time);
 int SU_Base_GetAlarm(SUTime *time);
+int SU_Base_SetAlarmTimeMs(int ms);
+int SU_Base_GetAlarmTimeMs(uint32_t *ms);
 int SU_Base_EnableAlarm(void);
 int SU_Base_DisableAlarm(void);
+int SU_Base_EnableAlarmTimeMs(void);
+int SU_Base_DisableAlarmTimeMs(void);
 int SU_Base_PollingAlarm(uint32_t timeoutMsec);
 int SU_Base_Shutdown(void);
 int SU_Base_Reboot(void);
 int SU_Base_Suspend(void);
 int SU_Base_SetWkupMode(SUWkup mode);
+int SU_Base_GetWkupMode(void);
+int SU_Base_GetWakeupCount(void);
+int SU_Base_CtlPwrDown(void);
 
 #ifdef __cplusplus
 }
