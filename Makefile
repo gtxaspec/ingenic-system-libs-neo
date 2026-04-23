@@ -14,7 +14,8 @@ CFLAGS  += -I$(CURDIR)/include
 LDFLAGS := -Wl,-Bsymbolic -Wl,--gc-sections -Wl,-z,max-page-size=0x1000
 
 ALOG_SRC     := libalog/alog.c
-SYSUTILS_SRC := libsysutils/sysutils.c
+SYSUTILS_SRC := libsysutils/su_base.c libsysutils/su_adc.c libsysutils/su_key.c \
+                libsysutils/su_cipher.c libsysutils/su_led.c libsysutils/su_pm.c
 ALOG_OBJ     := $(ALOG_SRC:.c=.o)
 SYSUTILS_OBJ := $(SYSUTILS_SRC:.c=.o)
 
