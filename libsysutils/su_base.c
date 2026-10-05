@@ -47,7 +47,15 @@
  * RTC_RD_TIME/RTC_SET_TIME ('p', 0x09/0x0a), which transfer a 36-byte
  * struct rtc_time.
  */
+#define INGENIC_RTC_REG_ACCESS _IOW('R', 0x09, int)   /* 0x80045209 */
 #define INGENIC_RTC_RD_MS      _IOWR('R', 0x0a, int)  /* 0xc004520a */
+
+/* argument of INGENIC_RTC_REG_ACCESS (layout as in the vendor lib) */
+struct ingenic_rtc_reg {
+	int cmd;    /* 0 = write, 1 = read */
+	int reg;
+	int val;
+};
 
 static pthread_mutex_t g_suspend_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -366,10 +374,12 @@ EXPORT int SU_Base_GetWkupMode(void)
 {
 	int fd = open_cloexec(RTC_DEV, O_RDWR);
 	if (fd < 0) return -1;
-	struct { int cmd, mode, result; } arg = { 1, 0, 0 };
-	int ret = ioctl(fd, RTC_RD_TIME, &arg);
+	struct ingenic_rtc_reg arg = { 1, 0x30, 0x0f };
+	int ret = ioctl(fd, INGENIC_RTC_REG_ACCESS, &arg);
 	close(fd);
-	return (ret < 0) ? -1 : arg.result;
+	if (ret < 0) return -1;
+	int mode = arg.val & 3;
+	return (mode == 3) ? 0 : mode;
 }
 
 EXPORT int SU_Base_GetWakeupCount(void)
