@@ -341,7 +341,12 @@ EXPORT int SU_Base_PollingAlarm(uint32_t timeoutMsec)
 	return (ret <= 0) ? -1 : 0;
 }
 
-EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGCHLD); return 0; }
+/*
+ * Vendor lib: sync(); kill(1, 17).  17 is SIGUSR2 on MIPS (SIGCHLD is 18
+ * there), which busybox init handles as "poweroff".  SIGCHLD is ignored
+ * by init, so the previous code never shut the device down.
+ */
+EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGUSR2); return 0; }
 EXPORT int SU_Base_Reboot(void)   { sync(); kill(1, SIGTERM); return 0; }
 
 EXPORT int SU_Base_Suspend(void)
