@@ -41,6 +41,14 @@
 #define RTC_AIE_OFF    _IO('p', 0x02)
 #endif
 
+/*
+ * Ingenic private RTC ioctls (T32/T33 rtc driver), as used by the vendor
+ * libsysutils.so (sdk 2.0.2.1).  Not to be confused with the generic
+ * RTC_RD_TIME/RTC_SET_TIME ('p', 0x09/0x0a), which transfer a 36-byte
+ * struct rtc_time.
+ */
+#define INGENIC_RTC_RD_MS      _IOWR('R', 0x0a, int)  /* 0xc004520a */
+
 static pthread_mutex_t g_suspend_lock = PTHREAD_MUTEX_INITIALIZER;
 
 EXPORT int mem_user_v;
@@ -187,11 +195,12 @@ EXPORT int SU_Base_GetTimeMs(int *ms)
 	if (!ms) return -1;
 	int fd = open_cloexec(RTC_DEV, O_RDONLY);
 	if (fd < 0) return -1;
-	int val = 0;
-	int ret = ioctl(fd, RTC_RD_TIME, &val);
+	/* 32768 Hz sub-second counter, converted like the vendor lib */
+	uint32_t cnt = 0;
+	int ret = ioctl(fd, INGENIC_RTC_RD_MS, &cnt);
 	close(fd);
 	if (ret < 0) return -1;
-	*ms = val;
+	*ms = (int)((cnt * 1000u + 0x4000u) >> 15);
 	return 0;
 }
 
