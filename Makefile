@@ -39,11 +39,22 @@ libsysutils.a: $(SYSUTILS_OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+TEST_WRAP := -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=kill,--wrap=sync
+
+# Host-only unit test: wraps open/ioctl/kill so no device is touched.
+test: tests/test_su_base
+	./tests/test_su_base
+
+tests/test_su_base: tests/test_su_base.c libsysutils/su_base.c
+	$(CC) -std=c11 -O1 -D_GNU_SOURCE -Wall -Wextra -I$(CURDIR)/include \
+		-fsanitize=address,undefined $(TEST_WRAP) -o $@ $^ -lpthread
+
 strip: all
 	$(STRIP) --strip-unneeded libalog.so libsysutils.so
 
 clean:
 	rm -f $(ALOG_OBJ) $(SYSUTILS_OBJ) libalog.so libalog.a libsysutils.so libsysutils.a
+	rm -f tests/test_su_base
 
 install: install-staging install-target
 
@@ -67,4 +78,4 @@ install-target:
 	install -m 755 libalog.so       $(DESTDIR)$(PREFIX)/lib/
 	install -m 755 libsysutils.so   $(DESTDIR)$(PREFIX)/lib/
 
-.PHONY: all clean strip install install-staging install-target
+.PHONY: all clean strip test install install-staging install-target
