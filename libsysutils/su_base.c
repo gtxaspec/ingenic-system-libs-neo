@@ -393,8 +393,8 @@ EXPORT int SU_Base_CtlPwrDown(void)
 	pthread_mutex_lock(&g_suspend_lock);
 	int fd = open_cloexec(RTC_DEV, O_RDWR);
 	if (fd < 0) { pthread_mutex_unlock(&g_suspend_lock); return -1; }
-	struct { int cmd, pad, val; } arg = { 0, 0x20, 0 };
-	int ret = ioctl(fd, RTC_WKALM_SET, &arg);
+	struct ingenic_rtc_reg arg = { 0, 0x20, 1 };
+	int ret = ioctl(fd, INGENIC_RTC_REG_ACCESS, &arg);
 	close(fd);
 	pthread_mutex_unlock(&g_suspend_lock);
 	return (ret < 0) ? -1 : 0;
