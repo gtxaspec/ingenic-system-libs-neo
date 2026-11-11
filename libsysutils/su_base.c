@@ -81,10 +81,11 @@ EXPORT int SU_Base_GetModelNumber(SUModelNum *modelNum)
 	if (!colon)
 		return -1;
 
-	const char *val = colon + 1;
-	while (*val == ' ')
+	char *val = colon + 1;
+	while (*val == ' ' || *val == '\t')
 		val++;
-	chomp((char *)val);
+	/* only the first cpuinfo line is the model name */
+	val[strcspn(val, "\r\n")] = '\0';
 
 	snprintf(modelNum->chr, MAX_INFO_LEN, "%s", val);
 	return 0;
@@ -153,6 +154,12 @@ EXPORT int SU_Base_GetDevID(SUDevID *devID)
 	}
 
 	munmap(map, mapsz);
+
+	/* all-zero means no ID could be read (e.g. no efuse): report failure */
+	if (strspn(devID->chr, "0") == strlen(devID->chr)) {
+		memset(devID, 0, sizeof(*devID));
+		return -1;
+	}
 	return 0;
 }
 
@@ -332,7 +339,7 @@ EXPORT int SU_Base_PollingAlarm(uint32_t timeoutMsec)
 	return (ret <= 0) ? -1 : 0;
 }
 
-EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGCHLD); return 0; }
+EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGUSR2); return 0; }
 EXPORT int SU_Base_Reboot(void)   { sync(); kill(1, SIGTERM); return 0; }
 
 EXPORT int SU_Base_Suspend(void)
