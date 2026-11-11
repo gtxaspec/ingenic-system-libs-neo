@@ -96,11 +96,14 @@ static int update_key_sysfs(const char *file, uint16_t want_flag)
 			break;
 		pos += n;
 	}
-	if (pos == 0)
-		return 0;
 	char path[96];
 	if (gpio_keys_path(path, sizeof(path), file) < 0)
 		return -1;
+	if (pos == 0) {
+		/* nothing disabled: clear the list ("keys" is read-only) */
+		list[0] = '\n';
+		pos = 1;
+	}
 	return write_file(path, list, (size_t)pos);
 }
 
@@ -155,7 +158,7 @@ EXPORT int SU_Key_EnableEvent(int keyCode)
 	if (load_keys() < 0) return -1;
 	for (int i = 0; i < g_key_count; i++)
 		if (g_keys[i].code == (uint16_t)keyCode) { g_keys[i].disabled = 0; break; }
-	return update_key_sysfs("keys", 0);
+	return update_key_sysfs("disabled_keys", 1);
 }
 
 EXPORT int SU_Key_DisableEvent(int keyCode)
