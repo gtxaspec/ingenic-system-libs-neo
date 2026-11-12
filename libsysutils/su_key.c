@@ -103,6 +103,11 @@ static int update_key_sysfs(const char *file, uint16_t want_flag)
 		/* nothing disabled: clear the list ("keys" is read-only) */
 		list[0] = '\n';
 		pos = 1;
+		if (write_file(path, list, (size_t)pos) == 0)
+			return 0;
+		/* newer kernels (4.4) reject the lone newline; an empty write is
+		 * accepted and leaves nothing disabled */
+		return write_file(path, list, 0);
 	}
 	return write_file(path, list, (size_t)pos);
 }
@@ -164,7 +169,15 @@ EXPORT int SU_Key_EnableEvent(int keyCode)
 EXPORT int SU_Key_DisableEvent(int keyCode)
 {
 	if (load_keys() < 0) return -1;
+	int idx = -1;
 	for (int i = 0; i < g_key_count; i++)
-		if (g_keys[i].code == (uint16_t)keyCode) { g_keys[i].disabled = 1; break; }
-	return update_key_sysfs("disabled_keys", 1);
+		if (g_keys[i].code == (uint16_t)keyCode) { idx = i; break; }
+	if (idx >= 0)
+		g_keys[idx].disabled = 1;
+	int ret = update_key_sysfs("disabled_keys", 1);
+	/* the kernel refused the list (key not can_disable): keep the cached
+	 * state in line with it so a later EnableEvent is not poisoned */
+	if (ret < 0 && idx >= 0)
+		g_keys[idx].disabled = 0;
+	return ret;
 }
