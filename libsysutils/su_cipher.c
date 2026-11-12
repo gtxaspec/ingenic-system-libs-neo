@@ -65,7 +65,7 @@ EXPORT int SU_CIPHER_Init(void)
 
 EXPORT int SU_CIPHER_Exit(void)
 {
-	if (g_aes_fd < 0) return EXIT_ERR;
+	if (g_aes_fd < 0) return UNINIT;
 	if (g_vbuf) {
 		munmap(g_vbuf, AES_DMA_BUF);
 		g_vbuf = NULL;
@@ -89,7 +89,7 @@ EXPORT int SU_CIPHER_DES_Init(void)
 
 EXPORT int SU_CIPHER_DES_Exit(void)
 {
-	if (g_des_fd < 0) return EXIT_ERR;
+	if (g_des_fd < 0) return UNINIT;
 	close(g_des_fd);
 	g_des_fd = -1;
 	return 0;
@@ -117,7 +117,8 @@ EXPORT int SU_CIPHER_DestroyHandle(int fd)
 
 EXPORT int SU_CIPHER_ConfigHandle(int hCipher, IN_UNF_CIPHER_CTRL *Ctrl)
 {
-	if (hCipher < 0 || hCipher >= MAX_HANDLES || !Ctrl) return INVALID_PARA;
+	if (!Ctrl) return SET_PARA_FAILED;
+	if (hCipher < 0 || hCipher >= MAX_HANDLES) return INVALID_PARA;
 	if (Ctrl->enAlg != IN_UNF_CIPHER_ALG_AES ||
 	    Ctrl->enKeyLen != IN_UNF_CIPHER_KEY_AES_128BIT ||
 	    Ctrl->enBitWidth != IN_UNF_CIPHER_BIT_WIDTH_128BIT ||
