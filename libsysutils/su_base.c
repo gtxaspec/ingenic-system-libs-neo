@@ -81,10 +81,11 @@ EXPORT int SU_Base_GetModelNumber(SUModelNum *modelNum)
 	if (!colon)
 		return -1;
 
-	const char *val = colon + 1;
-	while (*val == ' ')
+	char *val = colon + 1;
+	while (*val == ' ' || *val == '\t')
 		val++;
-	chomp((char *)val);
+	/* only the first cpuinfo line is the model name */
+	val[strcspn(val, "\r\n")] = '\0';
 
 	snprintf(modelNum->chr, MAX_INFO_LEN, "%s", val);
 	return 0;
@@ -153,6 +154,12 @@ EXPORT int SU_Base_GetDevID(SUDevID *devID)
 	}
 
 	munmap(map, mapsz);
+
+	/* all-zero means no ID could be read (e.g. no efuse): report failure */
+	if (strspn(devID->chr, "0") == strlen(devID->chr)) {
+		memset(devID, 0, sizeof(*devID));
+		return -1;
+	}
 	return 0;
 }
 
@@ -195,30 +202,60 @@ EXPORT int SU_Base_GetTimeMs(int *ms)
 	return 0;
 }
 
+/*
+ * SU_Base_SUTime2Raw / SU_Base_Raw2SUTime as the vendor libsysutils 1.3.0
+ * (T40 SDK) answers them, checked against the vendor code under unicorn
+ * (OpenIMP tests/su_time, issue Lu-Fi/openimp#321):
+ *  - SUTime2Raw is the kernel mktime() formula in 32-bit unsigned
+ *    arithmetic. It never fails and never normalises: out-of-range fields
+ *    (month 13, day 0, year 1969 ...) simply flow through the formula.
+ *  - Raw2SUTime writes plain struct tm fields (mon 0..11, year - 1900),
+ *    NOT the SUTime convention (mon 1..12, year > 1900) that SUTime2Raw
+ *    reads, so it is not the inverse of SUTime2Raw. Kept on purpose.
+ * Struct layout: SUTime and struct tm share the field order sec, min, hour,
+ * mday, mon, year.
+ */
 EXPORT int SU_Base_SUTime2Raw(SUTime *suTime, uint32_t *rawTime)
 {
 	if (!suTime || !rawTime) return -1;
-	struct tm tm_val = {
-		.tm_sec = suTime->sec, .tm_min = suTime->min,
-		.tm_hour = suTime->hour, .tm_mday = suTime->mday,
-		.tm_mon = suTime->mon - 1, .tm_year = suTime->year - 1900,
-		.tm_isdst = 0,
-	};
-	time_t t = timegm(&tm_val);
-	if (t == (time_t)-1) return -1;
-	*rawTime = (uint32_t)t;
+	int32_t mon = (int32_t)suTime->mon - 2;
+	uint32_t year = (uint32_t)suTime->year;
+	if (mon <= 0) {
+		mon += 12;
+		year -= 1;
+	}
+	uint32_t days = (year >> 2) + year / 400u + (uint32_t)suTime->mday;
+	days += year * 365u;
+	days += (uint32_t)(mon * 367) / 12u;
+	days -= year / 100u;
+	uint32_t t = ((days * 24u + (uint32_t)suTime->hour) * 60u +
+		      (uint32_t)suTime->min) * 60u + (uint32_t)suTime->sec;
+	*rawTime = t + 0x86b1bf80u; /* -719499 days * 86400 s, mod 2^32 */
 	return 0;
 }
 
 EXPORT int SU_Base_Raw2SUTime(uint32_t *rawTime, SUTime *suTime)
 {
 	if (!rawTime || !suTime) return -1;
-	time_t t = (time_t)*rawTime;
-	struct tm tm_val;
-	if (!gmtime_r(&t, &tm_val)) return -1;
-	suTime->sec = tm_val.tm_sec; suTime->min = tm_val.tm_min;
-	suTime->hour = tm_val.tm_hour; suTime->mday = tm_val.tm_mday;
-	suTime->mon = tm_val.tm_mon + 1; suTime->year = tm_val.tm_year + 1900;
+	/* UTC calendar of the full unsigned 32-bit range (1970 .. 2106), done
+	 * by hand: a 32-bit time_t would turn raw >= 2^31 negative. */
+	uint32_t raw = *rawTime;
+	uint32_t days = raw / 86400u, rem = raw % 86400u;
+	int64_t z = (int64_t)days + 719468;
+	int64_t era = z / 146097;
+	int64_t doe = z - era * 146097;
+	int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	int64_t mp = (5 * doy + 2) / 153;
+	int64_t d = doy - (153 * mp + 2) / 5 + 1;
+	int64_t m = mp < 10 ? mp + 3 : mp - 9;
+	int64_t y = yoe + era * 400 + (m <= 2);
+	suTime->sec = (int)(rem % 60);
+	suTime->min = (int)(rem / 60 % 60);
+	suTime->hour = (int)(rem / 3600);
+	suTime->mday = (int)d;
+	suTime->mon = (int)(m - 1);
+	suTime->year = (int)(y - 1900);
 	return 0;
 }
 
@@ -332,7 +369,7 @@ EXPORT int SU_Base_PollingAlarm(uint32_t timeoutMsec)
 	return (ret <= 0) ? -1 : 0;
 }
 
-EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGCHLD); return 0; }
+EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGUSR2); return 0; }
 EXPORT int SU_Base_Reboot(void)   { sync(); kill(1, SIGTERM); return 0; }
 
 EXPORT int SU_Base_Suspend(void)
