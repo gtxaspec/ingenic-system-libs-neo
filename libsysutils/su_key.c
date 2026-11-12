@@ -9,10 +9,29 @@
 #include "sysutils/su_misc.h"
 #include "su_internal.h"
 
-#define GPIO_KEYS_DIR   "/sys/devices/platform/gpio-keys"
-#define GPIO_KEYS_LIST  GPIO_KEYS_DIR "/keys"
-#define GPIO_KEYS_DIS   GPIO_KEYS_DIR "/disabled_keys"
+/* Boards register the platform device / input name either as "gpio-keys"
+ * or "gpio_keys" (e.g. T41), so accept both. */
+#define GPIO_KEYS_DIR_A "/sys/devices/platform/gpio-keys"
+#define GPIO_KEYS_DIR_B "/sys/devices/platform/gpio_keys"
 #define INPUT_DIR       "/dev/input"
+
+static const char *gpio_keys_dir(void)
+{
+	if (access(GPIO_KEYS_DIR_A, F_OK) == 0)
+		return GPIO_KEYS_DIR_A;
+	if (access(GPIO_KEYS_DIR_B, F_OK) == 0)
+		return GPIO_KEYS_DIR_B;
+	return NULL;
+}
+
+static int gpio_keys_path(char *out, size_t len, const char *file)
+{
+	const char *dir = gpio_keys_dir();
+	if (!dir)
+		return -1;
+	int n = snprintf(out, len, "%s/%s", dir, file);
+	return (n < 0 || (size_t)n >= len) ? -1 : 0;
+}
 
 struct key_entry {
 	uint16_t code;
@@ -27,8 +46,10 @@ static int load_keys(void)
 	if (g_keys)
 		return 0;
 
-	char buf[128];
-	if (read_file(GPIO_KEYS_LIST, buf, sizeof(buf)) <= 0)
+	char buf[128], path[96];
+	if (gpio_keys_path(path, sizeof(path), "keys") < 0)
+		return -1;
+	if (read_file(path, buf, sizeof(buf)) <= 0)
 		return -1;
 	chomp(buf);
 
@@ -59,7 +80,7 @@ static int load_keys(void)
 	return 0;
 }
 
-static int update_key_sysfs(const char *path, uint16_t want_flag)
+static int update_key_sysfs(const char *file, uint16_t want_flag)
 {
 	if (g_key_count <= 0)
 		return -1;
@@ -75,8 +96,19 @@ static int update_key_sysfs(const char *path, uint16_t want_flag)
 			break;
 		pos += n;
 	}
-	if (pos == 0)
-		return 0;
+	char path[96];
+	if (gpio_keys_path(path, sizeof(path), file) < 0)
+		return -1;
+	if (pos == 0) {
+		/* nothing disabled: clear the list ("keys" is read-only) */
+		list[0] = '\n';
+		pos = 1;
+		if (write_file(path, list, (size_t)pos) == 0)
+			return 0;
+		/* newer kernels (4.4) reject the lone newline; an empty write is
+		 * accepted and leaves nothing disabled */
+		return write_file(path, list, 0);
+	}
 	return write_file(path, list, (size_t)pos);
 }
 
@@ -94,7 +126,8 @@ EXPORT int SU_Key_OpenEvent(void)
 		char name[80];
 		memset(name, 0, sizeof(name));
 		if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) > 0 &&
-		    strcmp(name, "gpio-keys") == 0) {
+		    (strcmp(name, "gpio-keys") == 0 ||
+		     strcmp(name, "gpio_keys") == 0)) {
 			result_fd = fd;
 			break;
 		}
@@ -130,13 +163,21 @@ EXPORT int SU_Key_EnableEvent(int keyCode)
 	if (load_keys() < 0) return -1;
 	for (int i = 0; i < g_key_count; i++)
 		if (g_keys[i].code == (uint16_t)keyCode) { g_keys[i].disabled = 0; break; }
-	return update_key_sysfs(GPIO_KEYS_LIST, 0);
+	return update_key_sysfs("disabled_keys", 1);
 }
 
 EXPORT int SU_Key_DisableEvent(int keyCode)
 {
 	if (load_keys() < 0) return -1;
+	int idx = -1;
 	for (int i = 0; i < g_key_count; i++)
-		if (g_keys[i].code == (uint16_t)keyCode) { g_keys[i].disabled = 1; break; }
-	return update_key_sysfs(GPIO_KEYS_DIS, 1);
+		if (g_keys[i].code == (uint16_t)keyCode) { idx = i; break; }
+	if (idx >= 0)
+		g_keys[idx].disabled = 1;
+	int ret = update_key_sysfs("disabled_keys", 1);
+	/* the kernel refused the list (key not can_disable): keep the cached
+	 * state in line with it so a later EnableEvent is not poisoned */
+	if (ret < 0 && idx >= 0)
+		g_keys[idx].disabled = 0;
+	return ret;
 }
