@@ -369,7 +369,7 @@ EXPORT int SU_Base_PollingAlarm(uint32_t timeoutMsec)
 	return (ret <= 0) ? -1 : 0;
 }
 
-EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGUSR2); return 0; }
+EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGCHLD); return 0; }
 EXPORT int SU_Base_Reboot(void)   { sync(); kill(1, SIGTERM); return 0; }
 
 EXPORT int SU_Base_Suspend(void)
