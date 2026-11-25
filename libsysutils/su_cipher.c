@@ -1,6 +1,7 @@
 /* su_cipher.c -- Hardware AES/DES + buffer management. SPDX-License-Identifier: MIT */
 
 #include <stdlib.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -18,6 +19,13 @@
  * maps it through /dev/mem.  SET_PARA hands over key, IV, mode and the physical
  * and kernel-virtual (KSEG0) addresses of source and destination inside that
  * buffer, START_EN/START_DE run one DMA job.  All fields are 32 bit.
+ *
+ * The driver keeps the buffer and the parameters of SET_PARA in globals, so
+ * only one job can be prepared and run at a time: g_lock serialises them.
+ * Driver quirk: every open() of /dev/aes replaces that global buffer and every
+ * release frees it, so a second opener would free the buffer mapped here.
+ * This library opens the device once; handles are dup()s of that descriptor,
+ * which share the open file and do not release it.
  */
 #define JZAES_IOC_MAGIC       'A'
 #define IOCTL_AES_GET_PBUFF   _IO(JZAES_IOC_MAGIC, 110)
@@ -28,7 +36,6 @@
 #define AES_DMA_BUF    4096
 #define AES_HALF       (AES_DMA_BUF / 2)
 #define KSEG0          0x80000000u
-#define MAX_HANDLES    64
 
 struct aes_para {
 	uint32_t mem_p;
@@ -50,22 +57,72 @@ static int g_aes_fd = -1;
 static int g_mem_fd = -1;
 static uint32_t g_pbuf;              /* physical address of the driver buffer */
 static unsigned char *g_vbuf;        /* /dev/mem mapping of it (uncached) */
-static IN_UNF_CIPHER_CTRL g_ctrl[MAX_HANDLES];
-static unsigned char g_ctrl_set[MAX_HANDLES];
+
+/* one entry per handle from SU_CIPHER_CreateHandle, looked up by handle; the
+ * handle value itself (a descriptor number) is never used as an index */
+struct cipher_handle {
+	int handle;
+	int configured;
+	IN_UNF_CIPHER_CTRL ctrl;
+};
+static struct cipher_handle *g_handles;
+static size_t g_handle_count, g_handle_cap;
+
+/* guards all AES state above and the driver's DMA buffer and parameters */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int g_des_fd = -1;
 static void *g_cipher_buf;
 static int g_cipher_buf_len;
 
+static struct cipher_handle *handle_find(int h)
+{
+	for (size_t i = 0; i < g_handle_count; i++)
+		if (g_handles[i].handle == h)
+			return &g_handles[i];
+	return NULL;
+}
+
+static int handle_add(int h)
+{
+	if (g_handle_count == g_handle_cap) {
+		size_t cap = g_handle_cap ? g_handle_cap * 2 : 8;
+		struct cipher_handle *t = realloc(g_handles, cap * sizeof(*t));
+		if (!t) return -1;
+		g_handles = t;
+		g_handle_cap = cap;
+	}
+	memset(&g_handles[g_handle_count], 0, sizeof(*g_handles));
+	g_handles[g_handle_count++].handle = h;
+	return 0;
+}
+
+static void handle_del(int h)
+{
+	struct cipher_handle *e = handle_find(h);
+	if (e)
+		*e = g_handles[--g_handle_count];
+}
+
 EXPORT int SU_CIPHER_Init(void)
 {
-	if (g_aes_fd >= 0) return REINIT;
-	g_aes_fd = open_cloexec(AES_DEV, O_RDONLY);
-	return (g_aes_fd < 0) ? INIT_FAILED : 0;
+	pthread_mutex_lock(&g_lock);
+	int ret = REINIT;
+	if (g_aes_fd < 0) {
+		g_aes_fd = open_cloexec(AES_DEV, O_RDONLY);
+		ret = (g_aes_fd < 0) ? INIT_FAILED : 0;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_Exit(void)
 {
-	if (g_aes_fd < 0) return UNINIT;
+	pthread_mutex_lock(&g_lock);
+	if (g_aes_fd < 0) {
+		pthread_mutex_unlock(&g_lock);
+		return UNINIT;
+	}
 	if (g_vbuf) {
 		munmap(g_vbuf, AES_DMA_BUF);
 		g_vbuf = NULL;
@@ -76,7 +133,10 @@ EXPORT int SU_CIPHER_Exit(void)
 	}
 	close(g_aes_fd);
 	g_aes_fd = -1;
-	memset(g_ctrl_set, 0, sizeof(g_ctrl_set));
+	free(g_handles);
+	g_handles = NULL;
+	g_handle_count = g_handle_cap = 0;
+	pthread_mutex_unlock(&g_lock);
 	return 0;
 }
 
@@ -102,35 +162,55 @@ EXPORT int SU_CIPHER_DES_Test(void)
 
 EXPORT int SU_CIPHER_CreateHandle(void)
 {
-	if (g_aes_fd < 0) return UNINIT;
-	int fd = dup(g_aes_fd);
-	return (fd < 0) ? FAILED_GETHANDLE : fd;
+	pthread_mutex_lock(&g_lock);
+	int ret = UNINIT;
+	if (g_aes_fd >= 0) {
+		ret = dup(g_aes_fd);
+		if (ret < 0) {
+			ret = FAILED_GETHANDLE;
+		} else if (handle_add(ret) < 0) {
+			close(ret);
+			ret = FAILED_GETHANDLE;
+		}
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_DestroyHandle(int fd)
 {
 	if (fd < 0) return FAILED_DESHANDLE;
-	if (fd < MAX_HANDLES) g_ctrl_set[fd] = 0;
+	pthread_mutex_lock(&g_lock);
+	handle_del(fd);
 	close(fd);
+	pthread_mutex_unlock(&g_lock);
 	return 0;
 }
 
 EXPORT int SU_CIPHER_ConfigHandle(int hCipher, IN_UNF_CIPHER_CTRL *Ctrl)
 {
 	if (!Ctrl) return SET_PARA_FAILED;
-	if (hCipher < 0 || hCipher >= MAX_HANDLES) return INVALID_PARA;
+	if (hCipher < 0) return INVALID_PARA;
 	if (Ctrl->enAlg != IN_UNF_CIPHER_ALG_AES ||
 	    Ctrl->enKeyLen != IN_UNF_CIPHER_KEY_AES_128BIT ||
 	    Ctrl->enBitWidth != IN_UNF_CIPHER_BIT_WIDTH_128BIT ||
 	    (Ctrl->enWorkMode != IN_UNF_CIPHER_WORK_MODE_ECB &&
 	     Ctrl->enWorkMode != IN_UNF_CIPHER_WORK_MODE_CBC))
 		return SET_PARA_FAILED;
-	g_ctrl[hCipher] = *Ctrl;
-	g_ctrl_set[hCipher] = 1;
-	return 0;
+	pthread_mutex_lock(&g_lock);
+	int ret = INVALID_PARA;
+	struct cipher_handle *e = handle_find(hCipher);
+	if (e) {
+		e->ctrl = *Ctrl;
+		e->configured = 1;
+		ret = 0;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
-/* map the driver DMA buffer once (needs /dev/aes open and /dev/mem) */
+/* map the driver DMA buffer once (needs /dev/aes open and /dev/mem);
+ * called with g_lock held */
 static int cipher_map(void)
 {
 	if (g_vbuf) return 0;
@@ -152,13 +232,16 @@ static int cipher_map(void)
 
 /* run [src, src+len) through the engine in 2 KiB DMA jobs; CBC chains the
  * last ciphertext block of a job into the IV of the next one. Key, IV and
- * data words are passed to the engine exactly as the caller supplies them. */
-static int cipher_run(int h, const unsigned int *src, unsigned int *dst, unsigned int len, int decrypt)
+ * data words are passed to the engine exactly as the caller supplies them.
+ * Called with g_lock held, for the whole call: the DMA buffer and the driver
+ * parameters are shared by all handles and threads. */
+static int cipher_run_locked(int h, const unsigned int *src, unsigned int *dst, unsigned int len, int decrypt)
 {
-	if (h < 0 || h >= MAX_HANDLES || !g_ctrl_set[h]) return INVALID_PARA;
+	const struct cipher_handle *e = handle_find(h);
+	if (!e || !e->configured) return INVALID_PARA;
 	if (cipher_map() < 0) return FAILURE;
 
-	const IN_UNF_CIPHER_CTRL *c = &g_ctrl[h];
+	const IN_UNF_CIPHER_CTRL *c = &e->ctrl;
 	const unsigned char *s = (const unsigned char *)src;
 	unsigned char *d = (unsigned char *)dst;
 	uint32_t iv[4];
@@ -200,6 +283,14 @@ static int cipher_run(int h, const unsigned int *src, unsigned int *dst, unsigne
 		off += n;
 	}
 	return 0;
+}
+
+static int cipher_run(int h, const unsigned int *src, unsigned int *dst, unsigned int len, int decrypt)
+{
+	pthread_mutex_lock(&g_lock);
+	int ret = cipher_run_locked(h, src, dst, len, decrypt);
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_Encrypt(int hCipher, unsigned int *srcAddr,
