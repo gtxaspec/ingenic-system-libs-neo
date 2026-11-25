@@ -203,9 +203,13 @@ EXPORT int SU_Base_GetTimeMs(int *ms)
 }
 
 /*
- * SU_Base_SUTime2Raw / SU_Base_Raw2SUTime as the vendor libsysutils 1.3.0
- * (T40 SDK) answers them, checked against the vendor code under unicorn
- * (OpenIMP tests/su_time, issue Lu-Fi/openimp#321):
+ * SU_Base_SUTime2Raw / SU_Base_Raw2SUTime as the vendor libsysutils answers
+ * them.  Checked against the vendor code under unicorn (OpenIMP
+ * tests/su_time, issue Lu-Fi/openimp#321), first for 1.3.0 (T40 SDK) and then
+ * for every uClibc build at hand: T20 3.9.0/3.12.0, T21 1.0.33, T23
+ * 1.1.0-1.3.0, T30 1.0.5, T31 1.1.1-1.1.6, T32 1.0.4-2.2.0, T33 2.0.2.1, T40
+ * 1.0.2-1.3.1, T41 1.0.1-1.2.6, C100 2.1.0.  All of them give the same
+ * results:
  *  - SUTime2Raw is the kernel mktime() formula in 32-bit unsigned
  *    arithmetic. It never fails and never normalises: out-of-range fields
  *    (month 13, day 0, year 1969 ...) simply flow through the formula.
