@@ -39,7 +39,7 @@ libsysutils.a: $(SYSUTILS_OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-TEST_WRAP := -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=kill,--wrap=sync
+TEST_WRAP := -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=readlink,--wrap=kill,--wrap=sync
 
 # Host-only unit test: wraps open/ioctl/kill so no device is touched.
 test: tests/test_su_base

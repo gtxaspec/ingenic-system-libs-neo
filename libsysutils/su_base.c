@@ -42,13 +42,19 @@
 #endif
 
 /*
- * Ingenic private RTC ioctls (T32/T33 rtc driver), as used by the vendor
- * libsysutils.so (sdk 2.0.2.1).  Not to be confused with the generic
- * RTC_RD_TIME/RTC_SET_TIME ('p', 0x09/0x0a), which transfer a 36-byte
- * struct rtc_time.
+ * Ingenic private RTC ioctls, as used by the vendor libsysutils.so (T33
+ * sdk 2.0.2.1).  Not to be confused with the generic RTC_RD_TIME/RTC_SET_TIME
+ * ('p', 0x09/0x0a), which transfer a 36-byte struct rtc_time.
+ *
+ * REG_ACCESS (CTRL_RTC_REG) is known to both vendor RTC drivers: "jz-rtc"
+ * (rtc-jz.c, 3.10 T32/T33 kernels) and "rtc-ingenic" (rtc-ingenic.c, 4.4 and
+ * 5.15).  RD_MS (INGENIC_RTC_READ_TIME_MS) exists only in "jz-rtc".
  */
 #define INGENIC_RTC_REG_ACCESS _IOW('R', 0x09, int)   /* 0x80045209 */
 #define INGENIC_RTC_RD_MS      _IOWR('R', 0x0a, int)  /* 0xc004520a */
+
+#define RTC_DRIVER_LINK "/sys/class/rtc/rtc0/device/driver"
+#define RTC_DRIVER_MS   "jz-rtc"
 
 /* argument of INGENIC_RTC_REG_ACCESS (layout as in the vendor lib) */
 struct ingenic_rtc_reg {
@@ -198,9 +204,30 @@ EXPORT int SU_Base_SetTime(SUTime *time)
 	return (ret < 0) ? -1 : 0;
 }
 
+/*
+ * The sub-second ioctl must only reach a driver that implements it.
+ * rtc-ingenic.c (4.4/5.15) answers every unknown private ioctl with 0 and
+ * returns with its ioctl mutex still held, so trying the ioctl there would
+ * report a bogus 0 ms and block the next REG_ACCESS for good.  Only "jz-rtc"
+ * is known to have it (the T31 3.10 jz-rtc lacks it but rejects it with
+ * ENOTTY), so ask sysfs which driver is bound to rtc0 first.
+ */
+static bool rtc_has_ms_ioctl(void)
+{
+	char link[128];
+	ssize_t n = readlink(RTC_DRIVER_LINK, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	const char *name = strrchr(link, '/');
+	name = name ? name + 1 : link;
+	return strcmp(name, RTC_DRIVER_MS) == 0;
+}
+
 EXPORT int SU_Base_GetTimeMs(int *ms)
 {
 	if (!ms) return -1;
+	if (!rtc_has_ms_ioctl()) return -1;
 	int fd = open_cloexec(RTC_DEV, O_RDONLY);
 	if (fd < 0) return -1;
 	/* 32768 Hz sub-second counter, converted like the vendor lib */

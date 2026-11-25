@@ -1,6 +1,7 @@
 /*
  * test_su_base.c -- host test for su_base ioctl/signal usage.
- * Links su_base.c with --wrap=open,ioctl,kill,sync so no device is touched.
+ * Links su_base.c with --wrap=open,ioctl,readlink,kill,sync so no device is
+ * touched.
  * Every ioctl is checked against a guarded buffer: the encoded _IOC_SIZE
  * must not exceed the argument the library passed.
  * SPDX-License-Identifier: MIT
@@ -20,6 +21,18 @@ static int failures;
 static unsigned long last_req;
 static int last_reg[3];
 static int last_sig = -1;
+static int ms_ioctls;               /* how often 'R',10 reached the "driver" */
+static const char *rtc_driver;      /* driver link target, NULL = no link */
+
+ssize_t __wrap_readlink(const char *path, char *buf, size_t len)
+{
+	if (strcmp(path, "/sys/class/rtc/rtc0/device/driver") != 0 || !rtc_driver)
+		return -1;
+	size_t n = strlen(rtc_driver);
+	if (n > len) n = len;
+	memcpy(buf, rtc_driver, n);      /* not NUL-terminated, like readlink */
+	return (ssize_t)n;
+}
 
 int __wrap_open(const char *path, int flags, ...)
 {
@@ -39,6 +52,7 @@ int __wrap_ioctl(int fd, unsigned long req, ...)
 	if (fd != 100) return -1;
 	last_req = req;
 	if (req == _IOWR('R', 0x0a, int)) {
+		ms_ioctls++;
 		*(uint32_t *)arg = 16384;          /* half a second */
 		return 0;
 	}
@@ -61,10 +75,26 @@ int main(void)
 {
 	struct { int ms; uint32_t canary[16]; } g;
 	for (int i = 0; i < 16; i++) g.canary[i] = 0xdeadbeef;
+	rtc_driver = "../../../bus/platform/drivers/jz-rtc";
 	CHECK(SU_Base_GetTimeMs(&g.ms) == 0);
 	CHECK(g.ms == 500);
+	CHECK(ms_ioctls == 1);
 	CHECK(_IOC_SIZE(last_req) == sizeof(int));
 	for (int i = 0; i < 16; i++) CHECK(g.canary[i] == 0xdeadbeef);
+
+	/* any other driver (or none): fail without issuing the private ioctl */
+	static const char *const others[] = {
+		"../../../../bus/platform/drivers/rtc-ingenic",
+		"../../../bus/platform/drivers/jz4740-rtc",
+		"../../../bus/platform/drivers/jz-rtc2", "jz-rtc/", NULL,
+	};
+	for (unsigned i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+		rtc_driver = others[i];
+		g.ms = -7;
+		CHECK(SU_Base_GetTimeMs(&g.ms) == -1);
+		CHECK(g.ms == -7);
+	}
+	CHECK(ms_ioctls == 1);
 
 	CHECK(SU_Base_GetWkupMode() == 2);
 	CHECK(last_req == _IOW('R', 0x09, int));
