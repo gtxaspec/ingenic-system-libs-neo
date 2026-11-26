@@ -1,7 +1,9 @@
 /* su_cipher.c -- Hardware AES/DES + buffer management. SPDX-License-Identifier: MIT */
 
 #include <stdlib.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include "sysutils/su_cipher.h"
 #include "su_internal.h"
@@ -11,23 +13,130 @@
 #define CIPHER_BUF_MIN 16
 #define CIPHER_BUF_MAX 0x100000
 
+/*
+ * jz-aes kernel driver ABI (/dev/aes, misc device).  The driver owns one 4 KiB
+ * DMA buffer per open; userspace learns its physical address with GET_PBUFF and
+ * maps it through /dev/mem.  SET_PARA hands over key, IV, mode and the physical
+ * and kernel-virtual (KSEG0) addresses of source and destination inside that
+ * buffer, START_EN/START_DE run one DMA job.  All fields are 32 bit.
+ *
+ * The driver keeps the buffer and the parameters of SET_PARA in globals, so
+ * only one job can be prepared and run at a time: g_lock serialises them.
+ * Driver quirk: every open() of /dev/aes replaces that global buffer and every
+ * release frees it, so a second opener would free the buffer mapped here.
+ * This library opens the device once; handles are dup()s of that descriptor,
+ * which share the open file and do not release it.
+ */
+#define JZAES_IOC_MAGIC       'A'
+#define IOCTL_AES_GET_PBUFF   _IO(JZAES_IOC_MAGIC, 110)
+#define IOCTL_AES_SET_PARA    _IO(JZAES_IOC_MAGIC, 111)
+#define IOCTL_AES_START_EN    _IO(JZAES_IOC_MAGIC, 112)
+#define IOCTL_AES_START_DE    _IO(JZAES_IOC_MAGIC, 113)
+
+#define AES_DMA_BUF    4096
+#define AES_HALF       (AES_DMA_BUF / 2)
+#define KSEG0          0x80000000u
+
+struct aes_para {
+	uint32_t mem_p;
+	uint32_t status;
+	uint32_t aeskey[4];
+	uint32_t aesiv[4];
+	uint32_t src_addr_p;
+	uint32_t src_addr_v;
+	uint32_t dst_addr_p;
+	uint32_t dst_addr_v;
+	uint32_t enAlg;
+	uint32_t enBitWidth;
+	uint32_t enWorkMode;
+	uint32_t enKeyLen;
+	uint32_t dataLen;
+};
+
 static int g_aes_fd = -1;
+static int g_mem_fd = -1;
+static uint32_t g_pbuf;              /* physical address of the driver buffer */
+static unsigned char *g_vbuf;        /* /dev/mem mapping of it (uncached) */
+
+/* one entry per handle from SU_CIPHER_CreateHandle, looked up by handle; the
+ * handle value itself (a descriptor number) is never used as an index */
+struct cipher_handle {
+	int handle;
+	int configured;
+	IN_UNF_CIPHER_CTRL ctrl;
+};
+static struct cipher_handle *g_handles;
+static size_t g_handle_count, g_handle_cap;
+
+/* guards all AES state above and the driver's DMA buffer and parameters */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int g_des_fd = -1;
 static void *g_cipher_buf;
 static int g_cipher_buf_len;
 
+static struct cipher_handle *handle_find(int h)
+{
+	for (size_t i = 0; i < g_handle_count; i++)
+		if (g_handles[i].handle == h)
+			return &g_handles[i];
+	return NULL;
+}
+
+static int handle_add(int h)
+{
+	if (g_handle_count == g_handle_cap) {
+		size_t cap = g_handle_cap ? g_handle_cap * 2 : 8;
+		struct cipher_handle *t = realloc(g_handles, cap * sizeof(*t));
+		if (!t) return -1;
+		g_handles = t;
+		g_handle_cap = cap;
+	}
+	memset(&g_handles[g_handle_count], 0, sizeof(*g_handles));
+	g_handles[g_handle_count++].handle = h;
+	return 0;
+}
+
+static void handle_del(int h)
+{
+	struct cipher_handle *e = handle_find(h);
+	if (e)
+		*e = g_handles[--g_handle_count];
+}
+
 EXPORT int SU_CIPHER_Init(void)
 {
-	if (g_aes_fd >= 0) return REINIT;
-	g_aes_fd = open_cloexec(AES_DEV, O_RDONLY);
-	return (g_aes_fd < 0) ? INIT_FAILED : 0;
+	pthread_mutex_lock(&g_lock);
+	int ret = REINIT;
+	if (g_aes_fd < 0) {
+		g_aes_fd = open_cloexec(AES_DEV, O_RDONLY);
+		ret = (g_aes_fd < 0) ? INIT_FAILED : 0;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_Exit(void)
 {
-	if (g_aes_fd < 0) return EXIT_ERR;
+	pthread_mutex_lock(&g_lock);
+	if (g_aes_fd < 0) {
+		pthread_mutex_unlock(&g_lock);
+		return UNINIT;
+	}
+	if (g_vbuf) {
+		munmap(g_vbuf, AES_DMA_BUF);
+		g_vbuf = NULL;
+	}
+	if (g_mem_fd >= 0) {
+		close(g_mem_fd);
+		g_mem_fd = -1;
+	}
 	close(g_aes_fd);
 	g_aes_fd = -1;
+	free(g_handles);
+	g_handles = NULL;
+	g_handle_count = g_handle_cap = 0;
+	pthread_mutex_unlock(&g_lock);
 	return 0;
 }
 
@@ -40,7 +149,7 @@ EXPORT int SU_CIPHER_DES_Init(void)
 
 EXPORT int SU_CIPHER_DES_Exit(void)
 {
-	if (g_des_fd < 0) return EXIT_ERR;
+	if (g_des_fd < 0) return UNINIT;
 	close(g_des_fd);
 	g_des_fd = -1;
 	return 0;
@@ -53,40 +162,151 @@ EXPORT int SU_CIPHER_DES_Test(void)
 
 EXPORT int SU_CIPHER_CreateHandle(void)
 {
-	if (g_aes_fd < 0) return UNINIT;
-	int fd = dup(g_aes_fd);
-	return (fd < 0) ? FAILED_GETHANDLE : fd;
+	pthread_mutex_lock(&g_lock);
+	int ret = UNINIT;
+	if (g_aes_fd >= 0) {
+		ret = dup(g_aes_fd);
+		if (ret < 0) {
+			ret = FAILED_GETHANDLE;
+		} else if (handle_add(ret) < 0) {
+			close(ret);
+			ret = FAILED_GETHANDLE;
+		}
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_DestroyHandle(int fd)
 {
 	if (fd < 0) return FAILED_DESHANDLE;
+	pthread_mutex_lock(&g_lock);
+	handle_del(fd);
 	close(fd);
+	pthread_mutex_unlock(&g_lock);
 	return 0;
 }
 
 EXPORT int SU_CIPHER_ConfigHandle(int hCipher, IN_UNF_CIPHER_CTRL *Ctrl)
 {
-	if (hCipher < 0 || !Ctrl) return INVALID_PARA;
-	return ioctl(hCipher, 0, Ctrl) < 0 ? SET_PARA_FAILED : 0;
+	if (!Ctrl) return SET_PARA_FAILED;
+	if (hCipher < 0) return INVALID_PARA;
+	if (Ctrl->enAlg != IN_UNF_CIPHER_ALG_AES ||
+	    Ctrl->enKeyLen != IN_UNF_CIPHER_KEY_AES_128BIT ||
+	    Ctrl->enBitWidth != IN_UNF_CIPHER_BIT_WIDTH_128BIT ||
+	    (Ctrl->enWorkMode != IN_UNF_CIPHER_WORK_MODE_ECB &&
+	     Ctrl->enWorkMode != IN_UNF_CIPHER_WORK_MODE_CBC))
+		return SET_PARA_FAILED;
+	pthread_mutex_lock(&g_lock);
+	int ret = INVALID_PARA;
+	struct cipher_handle *e = handle_find(hCipher);
+	if (e) {
+		e->ctrl = *Ctrl;
+		e->configured = 1;
+		ret = 0;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return ret;
+}
+
+/* map the driver DMA buffer once (needs /dev/aes open and /dev/mem);
+ * called with g_lock held */
+static int cipher_map(void)
+{
+	if (g_vbuf) return 0;
+	if (g_aes_fd < 0) return -1;
+	uint32_t pb = 0;
+	if (ioctl(g_aes_fd, IOCTL_AES_GET_PBUFF, &pb) < 0 || !pb) return -1;
+	int mfd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+	if (mfd < 0) return -1;
+	void *m = mmap(NULL, AES_DMA_BUF, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, (off_t)pb);
+	if (m == MAP_FAILED) {
+		close(mfd);
+		return -1;
+	}
+	g_mem_fd = mfd;
+	g_pbuf = pb;
+	g_vbuf = m;
+	return 0;
+}
+
+/* run [src, src+len) through the engine in 2 KiB DMA jobs; CBC chains the
+ * last ciphertext block of a job into the IV of the next one. Key, IV and
+ * data words are passed to the engine exactly as the caller supplies them.
+ * Called with g_lock held, for the whole call: the DMA buffer and the driver
+ * parameters are shared by all handles and threads. */
+static int cipher_run_locked(int h, const unsigned int *src, unsigned int *dst, unsigned int len, int decrypt)
+{
+	const struct cipher_handle *e = handle_find(h);
+	if (!e || !e->configured) return INVALID_PARA;
+	if (cipher_map() < 0) return FAILURE;
+
+	const IN_UNF_CIPHER_CTRL *c = &e->ctrl;
+	const unsigned char *s = (const unsigned char *)src;
+	unsigned char *d = (unsigned char *)dst;
+	uint32_t iv[4];
+	memcpy(iv, c->IV, sizeof(iv));
+
+	for (unsigned int off = 0; off < len;) {
+		unsigned int n = len - off;
+		if (n > AES_HALF) n = AES_HALF;
+
+		memcpy(g_vbuf, s + off, n);
+		struct aes_para p;
+		memset(&p, 0, sizeof(p));
+		p.mem_p = g_pbuf;
+		memcpy(p.aeskey, c->key, sizeof(p.aeskey));
+		memcpy(p.aesiv, iv, sizeof(p.aesiv));
+		p.src_addr_p = g_pbuf;
+		p.src_addr_v = KSEG0 | g_pbuf;
+		p.dst_addr_p = g_pbuf + AES_HALF;
+		p.dst_addr_v = KSEG0 | (g_pbuf + AES_HALF);
+		p.enAlg = c->enAlg;
+		p.enBitWidth = c->enBitWidth;
+		p.enWorkMode = c->enWorkMode;
+		p.enKeyLen = c->enKeyLen;
+		p.dataLen = n;
+
+		uint32_t next_iv[4];
+		memcpy(next_iv, g_vbuf + n - 16, sizeof(next_iv));   /* last input block */
+
+		if (ioctl(g_aes_fd, IOCTL_AES_SET_PARA, &p) < 0) return FAILURE;
+		if (ioctl(g_aes_fd, decrypt ? IOCTL_AES_START_DE : IOCTL_AES_START_EN, 0) < 0) return FAILURE;
+
+		memcpy(d + off, g_vbuf + AES_HALF, n);
+		if (c->enWorkMode == IN_UNF_CIPHER_WORK_MODE_CBC) {
+			if (decrypt)
+				memcpy(iv, next_iv, sizeof(iv));          /* last ciphertext block = input */
+			else
+				memcpy(iv, d + off + n - 16, sizeof(iv)); /* last ciphertext block = output */
+		}
+		off += n;
+	}
+	return 0;
+}
+
+static int cipher_run(int h, const unsigned int *src, unsigned int *dst, unsigned int len, int decrypt)
+{
+	pthread_mutex_lock(&g_lock);
+	int ret = cipher_run_locked(h, src, dst, len, decrypt);
+	pthread_mutex_unlock(&g_lock);
+	return ret;
 }
 
 EXPORT int SU_CIPHER_Encrypt(int hCipher, unsigned int *srcAddr,
                              unsigned int *dstAddr, unsigned int dataLen)
 {
 	if (hCipher < 0 || !srcAddr || !dstAddr) return INVALID_PARA;
-	if (dataLen == 0 || dataLen > 1024 * 1024) return SET_DATALEN_ERR;
-	struct { unsigned int *src, *dst; unsigned int len; } args = { srcAddr, dstAddr, dataLen };
-	return ioctl(hCipher, 1, &args) < 0 ? FAILURE : 0;
+	if (dataLen == 0 || dataLen > 1024 * 1024 || (dataLen & 15)) return SET_DATALEN_ERR;
+	return cipher_run(hCipher, srcAddr, dstAddr, dataLen, 0);
 }
 
 EXPORT int SU_CIPHER_Decrypt(int hCipher, unsigned int *srcAddr,
                              unsigned int *dstAddr, unsigned int dataLen)
 {
 	if (hCipher < 0 || !srcAddr || !dstAddr) return INVALID_PARA;
-	if (dataLen == 0 || dataLen > 1024 * 1024) return SET_DATALEN_ERR;
-	struct { unsigned int *src, *dst; unsigned int len; } args = { srcAddr, dstAddr, dataLen };
-	return ioctl(hCipher, 2, &args) < 0 ? FAILURE : 0;
+	if (dataLen == 0 || dataLen > 1024 * 1024 || (dataLen & 15)) return SET_DATALEN_ERR;
+	return cipher_run(hCipher, srcAddr, dstAddr, dataLen, 1);
 }
 
 EXPORT int SU_CIPHER_Malloc_Buffer(int size)
