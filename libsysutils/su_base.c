@@ -41,6 +41,28 @@
 #define RTC_AIE_OFF    _IO('p', 0x02)
 #endif
 
+/*
+ * Ingenic private RTC ioctls, as used by the vendor libsysutils.so (T33
+ * sdk 2.0.2.1).  Not to be confused with the generic RTC_RD_TIME/RTC_SET_TIME
+ * ('p', 0x09/0x0a), which transfer a 36-byte struct rtc_time.
+ *
+ * REG_ACCESS (CTRL_RTC_REG) is known to both vendor RTC drivers: "jz-rtc"
+ * (rtc-jz.c, 3.10 T32/T33 kernels) and "rtc-ingenic" (rtc-ingenic.c, 4.4 and
+ * 5.15).  RD_MS (INGENIC_RTC_READ_TIME_MS) exists only in "jz-rtc".
+ */
+#define INGENIC_RTC_REG_ACCESS _IOW('R', 0x09, int)   /* 0x80045209 */
+#define INGENIC_RTC_RD_MS      _IOWR('R', 0x0a, int)  /* 0xc004520a */
+
+#define RTC_DRIVER_LINK "/sys/class/rtc/rtc0/device/driver"
+#define RTC_DRIVER_MS   "jz-rtc"
+
+/* argument of INGENIC_RTC_REG_ACCESS (layout as in the vendor lib) */
+struct ingenic_rtc_reg {
+	int cmd;    /* 0 = write, 1 = read */
+	int reg;
+	int val;
+};
+
 static pthread_mutex_t g_suspend_lock = PTHREAD_MUTEX_INITIALIZER;
 
 EXPORT int mem_user_v;
@@ -182,16 +204,38 @@ EXPORT int SU_Base_SetTime(SUTime *time)
 	return (ret < 0) ? -1 : 0;
 }
 
+/*
+ * The sub-second ioctl must only reach a driver that implements it.
+ * rtc-ingenic.c (4.4/5.15) answers every unknown private ioctl with 0 and
+ * returns with its ioctl mutex still held, so trying the ioctl there would
+ * report a bogus 0 ms and block the next REG_ACCESS for good.  Only "jz-rtc"
+ * is known to have it (the T31 3.10 jz-rtc lacks it but rejects it with
+ * ENOTTY), so ask sysfs which driver is bound to rtc0 first.
+ */
+static bool rtc_has_ms_ioctl(void)
+{
+	char link[128];
+	ssize_t n = readlink(RTC_DRIVER_LINK, link, sizeof(link) - 1);
+	if (n <= 0)
+		return false;
+	link[n] = '\0';
+	const char *name = strrchr(link, '/');
+	name = name ? name + 1 : link;
+	return strcmp(name, RTC_DRIVER_MS) == 0;
+}
+
 EXPORT int SU_Base_GetTimeMs(int *ms)
 {
 	if (!ms) return -1;
+	if (!rtc_has_ms_ioctl()) return -1;
 	int fd = open_cloexec(RTC_DEV, O_RDONLY);
 	if (fd < 0) return -1;
-	int val = 0;
-	int ret = ioctl(fd, RTC_RD_TIME, &val);
+	/* 32768 Hz sub-second counter, converted like the vendor lib */
+	uint32_t cnt = 0;
+	int ret = ioctl(fd, INGENIC_RTC_RD_MS, &cnt);
 	close(fd);
 	if (ret < 0) return -1;
-	*ms = val;
+	*ms = (int)((cnt * 1000u + 0x4000u) >> 15);
 	return 0;
 }
 
@@ -332,7 +376,12 @@ EXPORT int SU_Base_PollingAlarm(uint32_t timeoutMsec)
 	return (ret <= 0) ? -1 : 0;
 }
 
-EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGCHLD); return 0; }
+/*
+ * Vendor lib: sync(); kill(1, 17).  17 is SIGUSR2 on MIPS (SIGCHLD is 18
+ * there), which busybox init handles as "poweroff".  SIGCHLD is ignored
+ * by init, so the previous code never shut the device down.
+ */
+EXPORT int SU_Base_Shutdown(void) { sync(); kill(1, SIGUSR2); return 0; }
 EXPORT int SU_Base_Reboot(void)   { sync(); kill(1, SIGTERM); return 0; }
 
 EXPORT int SU_Base_Suspend(void)
@@ -352,10 +401,12 @@ EXPORT int SU_Base_GetWkupMode(void)
 {
 	int fd = open_cloexec(RTC_DEV, O_RDWR);
 	if (fd < 0) return -1;
-	struct { int cmd, mode, result; } arg = { 1, 0, 0 };
-	int ret = ioctl(fd, RTC_RD_TIME, &arg);
+	struct ingenic_rtc_reg arg = { 1, 0x30, 0x0f };
+	int ret = ioctl(fd, INGENIC_RTC_REG_ACCESS, &arg);
 	close(fd);
-	return (ret < 0) ? -1 : arg.result;
+	if (ret < 0) return -1;
+	int mode = arg.val & 3;
+	return (mode == 3) ? 0 : mode;
 }
 
 EXPORT int SU_Base_GetWakeupCount(void)
@@ -369,8 +420,8 @@ EXPORT int SU_Base_CtlPwrDown(void)
 	pthread_mutex_lock(&g_suspend_lock);
 	int fd = open_cloexec(RTC_DEV, O_RDWR);
 	if (fd < 0) { pthread_mutex_unlock(&g_suspend_lock); return -1; }
-	struct { int cmd, pad, val; } arg = { 0, 0x20, 0 };
-	int ret = ioctl(fd, RTC_WKALM_SET, &arg);
+	struct ingenic_rtc_reg arg = { 0, 0x20, 1 };
+	int ret = ioctl(fd, INGENIC_RTC_REG_ACCESS, &arg);
 	close(fd);
 	pthread_mutex_unlock(&g_suspend_lock);
 	return (ret < 0) ? -1 : 0;
