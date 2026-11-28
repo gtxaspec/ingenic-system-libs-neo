@@ -5,7 +5,7 @@ BIN := tests/test_su_key
 
 # the binary is removed again, so nothing untracked is left behind
 check: $(BIN)
-	./$(BIN); rc=$$?; rm -f $(BIN); exit $$rc
+	./$(BIN) && ./$(BIN) empty; rc=$$?; rm -f $(BIN); exit $$rc
 
 $(BIN): tests/test_su_key.c libsysutils/su_key.c
 	$(CC) -std=c11 -O1 -g -D_GNU_SOURCE -Wall -Wextra -Iinclude \

@@ -40,6 +40,7 @@ struct key_entry {
 
 static struct key_entry *g_keys;
 static int g_key_count;
+static int g_keys_loaded;	/* a gpio-keys device may have no keys */
 
 /* Next item of a kernel bitmap list ("28", "28-30"; items separated by
  * commas, list ended by a newline).  Returns 1 with the range, 0 at the end
@@ -68,13 +69,14 @@ static int next_range(char **pos, unsigned long *lo, unsigned long *hi)
 
 static int load_keys(void)
 {
-	if (g_keys)
+	if (g_keys || g_keys_loaded)
 		return 0;
 
 	char buf[128], path[96];
 	if (gpio_keys_path(path, sizeof(path), "keys") < 0)
 		return -1;
-	if (read_file(path, buf, sizeof(buf)) <= 0)
+	/* an empty list is valid: the vendor load_globle_keys loads 0 keys */
+	if (read_file(path, buf, sizeof(buf)) < 0)
 		return -1;
 
 	/* the kernel prints the key codes as a bitmap list, so neighbouring
@@ -85,8 +87,13 @@ static int load_keys(void)
 	char *p = buf;
 	while ((r = next_range(&p, &lo, &hi)) > 0)
 		count += hi - lo + 1;
-	if (r < 0 || count == 0)
+	if (r < 0)
 		return -1;
+	if (count == 0) {
+		g_key_count = 0;
+		g_keys_loaded = 1;
+		return 0;
+	}
 
 	struct key_entry *keys = calloc(count, sizeof(*keys));
 	if (!keys)
@@ -99,14 +106,16 @@ static int load_keys(void)
 			keys[i++].code = (uint16_t)c;
 	g_keys = keys;
 	g_key_count = (int)i;
+	g_keys_loaded = 1;
 	return 0;
 }
 
 /* write the list of all keys flagged disabled to disabled_keys */
 static int write_disabled_keys(void)
 {
+	/* vendor update_enabled_keys: key count <= 0 -> 0, no sysfs I/O */
 	if (g_key_count <= 0)
-		return -1;
+		return 0;
 
 	char list[128];
 	int pos = 0;
