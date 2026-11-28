@@ -450,10 +450,20 @@ EXPORT int SU_Base_GetWkupMode(void)
 	return (mode == 3) ? 0 : mode;
 }
 
+/*
+ * Vendor libsysutils (T33 2.0.2.1 0x1d14, T32 2.1.0.0 0x1d14, T32 1.0.6
+ * 0x1ae0): fopen of wakeup_count fails -> 1; fread gives 0 bytes -> -1;
+ * otherwise 0.  The count itself is not returned.
+ */
 EXPORT int SU_Base_GetWakeupCount(void)
 {
 	char buf[64];
-	return (read_file(WAKEUP_COUNT, buf, sizeof(buf)) <= 0) ? -1 : 0;
+	int fd = open_cloexec(WAKEUP_COUNT, O_RDONLY);
+	if (fd < 0)
+		return 1;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	return (n <= 0) ? -1 : 0;
 }
 
 EXPORT int SU_Base_CtlPwrDown(void)

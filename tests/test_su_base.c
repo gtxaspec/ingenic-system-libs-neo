@@ -34,14 +34,27 @@ ssize_t __wrap_readlink(const char *path, char *buf, size_t len)
 	return (ssize_t)n;
 }
 
+static int wakeup_mode;             /* 0 = node missing, 1 = empty, 2 = data */
+
+ssize_t __real_read(int fd, void *buf, size_t len);
+ssize_t __wrap_read(int fd, void *buf, size_t len)
+{
+	if (fd != 101) return __real_read(fd, buf, len);
+	if (wakeup_mode == 1) return 0;
+	memcpy(buf, "42\n", 3);
+	return 3;
+}
+
 int __wrap_open(const char *path, int flags, ...)
 {
 	(void)flags;
+	if (strcmp(path, "/sys/power/wakeup_count") == 0 && wakeup_mode)
+		return 101;
 	return strcmp(path, "/dev/rtc0") == 0 ? 100 : -1;
 }
 
 int __real_close(int fd);
-int __wrap_close(int fd) { return fd == 100 ? 0 : __real_close(fd); }
+int __wrap_close(int fd) { return (fd == 100 || fd == 101) ? 0 : __real_close(fd); }
 
 int __wrap_ioctl(int fd, unsigned long req, ...)
 {
@@ -103,6 +116,14 @@ int main(void)
 	CHECK(SU_Base_CtlPwrDown() == 0);
 	CHECK(last_req == _IOW('R', 0x09, int));
 	CHECK(last_reg[0] == 0 && last_reg[1] == 0x20 && last_reg[2] == 1);
+
+	/* vendor T33 2.0.2.1 0x1d14: node missing -> 1, 0 bytes -> -1, data -> 0 */
+	CHECK(SU_Base_GetWakeupCount() == 1);
+	wakeup_mode = 1;
+	CHECK(SU_Base_GetWakeupCount() == -1);
+	wakeup_mode = 2;
+	CHECK(SU_Base_GetWakeupCount() == 0);
+	wakeup_mode = 0;
 
 	SU_Base_Shutdown();
 	CHECK(last_sig == SIGUSR2);

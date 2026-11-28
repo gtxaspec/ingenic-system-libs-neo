@@ -35,6 +35,7 @@ static int k_reject_all;             /* vendor 4.4.94 store helper */
 static int k_stores;                 /* stores that reached the driver */
 static int k_empty_writes;           /* zero-length writes (never reach it) */
 static size_t rd_pos;
+static int k_empty_list;             /* gpio-keys without keys (T33L) */
 
 int __wrap_access(const char *path, int mode)
 {
@@ -62,7 +63,7 @@ ssize_t __wrap_read(int fd, void *buf, size_t len)
 	if (fd != FD_KEYS && fd != FD_DIS) return __real_read(fd, buf, len);
 	char out[64] = "";
 	if (fd == FD_KEYS) {
-		strcpy(out, "28-29,31\n");      /* the kernel prints ranges */
+		strcpy(out, k_empty_list ? "\n" : "28-29,31\n");  /* kernel prints ranges */
 	} else {
 		/* like "%*pbl": 28-29 collapse into a range */
 		if (k_disabled[0] && k_disabled[1]) strcat(out, "28-29");
@@ -102,8 +103,19 @@ ssize_t __wrap_write(int fd, const void *buf, size_t len)
 	return (ssize_t)len;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	/* 0. gpio-keys device without keys (vendor: loads 0 keys, update
+	 *    returns 0 without sysfs I/O).  Own run: the key list is cached. */
+	if (argc > 1 && strcmp(argv[1], "empty") == 0) {
+		k_empty_list = 1;
+		CHECK(SU_Key_DisableEvent(28) == 0);
+		CHECK(SU_Key_EnableEvent(28) == 0);
+		CHECK(k_stores == 0 && k_empty_writes == 0);
+		printf("%s empty-list (%d failures)\n", failures ? "FAILED" : "OK", failures);
+		return failures != 0;
+	}
+
 	/* 1. working kernel, all keys can_disable */
 	for (int i = 0; i < NKEYS; i++) k_can_disable[i] = 1;
 	CHECK(SU_Key_DisableEvent(28) == 0 && k_disabled[0] && !k_disabled[1]);
